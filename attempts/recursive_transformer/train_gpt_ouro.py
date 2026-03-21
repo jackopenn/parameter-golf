@@ -261,9 +261,9 @@ def eval_val(
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 result = model(x, y)
-                # forward returns (combined_loss, iter_losses) tuple; use last iteration's loss for val
+                # forward returns (combined_loss, iter_losses, q_probs, entropy) tuple; use last iteration's loss for val
                 if isinstance(result, tuple):
-                    _, iter_losses = result
+                    _, iter_losses, _, _ = result
                     batch_loss = iter_losses[-1].detach()
                 else:
                     batch_loss = result.detach()
@@ -787,7 +787,9 @@ class OuroGPT(nn.Module):
 
         combined_loss = weighted_loss - self.entropy_beta * entropy
         step_losses_detached = [l.detach() for l in step_losses]
-        return combined_loss, step_losses_detached
+        q_probs_detached = [q.detach() for q in q_probs]
+        entropy_detached = entropy.detach()
+        return combined_loss, step_losses_detached, q_probs_detached, entropy_detached
 
 
 # -----------------------------
@@ -1024,6 +1026,7 @@ def main() -> None:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_result = model(x, y)
                     warmup_loss = warmup_result[0] if isinstance(warmup_result, tuple) else warmup_result
+                    del warmup_result
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1087,6 +1090,8 @@ def main() -> None:
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         iter_losses_accum: list[float] = [0.0] * args.num_iterations
+        q_probs_accum: list[float] = [0.0] * args.num_iterations
+        entropy_accum: float = 0.0
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1094,15 +1099,20 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 result = model(x, y)
                 if isinstance(result, tuple):
-                    loss, iter_losses = result
+                    loss, iter_losses, q_probs, ent = result
                     for i, il in enumerate(iter_losses):
                         iter_losses_accum[i] += il.item()
+                    for i, qp in enumerate(q_probs):
+                        q_probs_accum[i] += qp.item()
+                    entropy_accum += ent.item()
                 else:
                     loss = result
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
         iter_losses_accum = [v / grad_accum_steps for v in iter_losses_accum]
+        q_probs_accum = [v / grad_accum_steps for v in q_probs_accum]
+        entropy_accum /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1127,9 +1137,10 @@ def main() -> None:
         )
         if should_log_train:
             iter_str = " ".join(f"iter{i}:{v:.4f}" for i, v in enumerate(iter_losses_accum))
+            q_str = " ".join(f"q{i}:{v:.3f}" for i, v in enumerate(q_probs_accum))
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"{iter_str} "
+                f"{iter_str} {q_str} entropy:{entropy_accum:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
