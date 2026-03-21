@@ -772,15 +772,19 @@ class OuroGPT(nn.Module):
             step_losses.append(self._compute_logits_and_loss(x, targets))
 
         # Ouro objective: weighted loss - beta * entropy
+        # Hazard-rate exit distribution: q(t) = lambda_t * survival for t < T,
+        # q(T) = survival (forced exit at last step). Guarantees sum(q) = 1.
         lambdas = [torch.sigmoid(g) for g in gate_logits]
         survival = torch.ones((), device=x.device, dtype=torch.float32)
         q_probs: list[Tensor] = []
         for t in range(self.num_iterations):
-            q_probs.append(lambdas[t] * survival)
-            survival = survival * (1.0 - lambdas[t])
-
-        q_sum = sum(q_probs) + 1e-8
-        q_probs = [q / q_sum for q in q_probs]
+            if t < self.num_iterations - 1:
+                q_t = lambdas[t] * survival
+                q_probs.append(q_t)
+                survival = survival * (1.0 - lambdas[t])
+            else:
+                # Last step: forced exit — assign all remaining survival probability
+                q_probs.append(survival)
 
         weighted_loss = sum(q_probs[t] * step_losses[t] for t in range(self.num_iterations))
         entropy = -sum(q * torch.log(q + 1e-8) for q in q_probs)
