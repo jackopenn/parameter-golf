@@ -672,7 +672,6 @@ class OuroGPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        entropy_beta: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -681,7 +680,6 @@ class OuroGPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.num_iterations = num_iterations
-        self.entropy_beta = entropy_beta
         self.num_blocks = num_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
@@ -709,16 +707,6 @@ class OuroGPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-
-        # Per-iteration exit gates (tiny: num_iterations * (model_dim + 1) params)
-        self.exit_gates = nn.ParameterList([
-            nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
-            for _ in range(num_iterations)
-        ])
-        self.gate_bias = nn.ParameterList([
-            nn.Parameter(torch.tensor(-1.0 if i < num_iterations - 1 else 1.0, dtype=torch.float32))
-            for i in range(num_iterations)
-        ])
 
         self._init_weights()
 
@@ -764,36 +752,14 @@ class OuroGPT(nn.Module):
                     x = self.blocks[block_idx](x, x0)
                 effective_layer += 1
 
-            # Compute exit gate and loss at every iteration
-            h_pooled = x.mean(dim=1)  # (batch, dim)
-            g = (h_pooled * self.exit_gates[iteration].to(h_pooled.dtype)).sum(-1).mean()
-            g = g + self.gate_bias[iteration].to(g.dtype)
-            gate_logits.append(g)
+            # Log intermediate losses but only train on final iteration's loss
             step_losses.append(self._compute_logits_and_loss(x, targets))
 
-        # Ouro objective: weighted loss - beta * entropy
-        # Hazard-rate exit distribution: q(t) = lambda_t * survival for t < T,
-        # q(T) = survival (forced exit at last step). Guarantees sum(q) = 1.
-        lambdas = [torch.sigmoid(g) for g in gate_logits]
-        survival = torch.ones((), device=x.device, dtype=torch.float32)
-        q_probs: list[Tensor] = []
-        for t in range(self.num_iterations):
-            if t < self.num_iterations - 1:
-                q_t = lambdas[t] * survival
-                q_probs.append(q_t)
-                survival = survival * (1.0 - lambdas[t])
-            else:
-                # Last step: forced exit — assign all remaining survival probability
-                q_probs.append(survival)
-
-        weighted_loss = sum(q_probs[t] * step_losses[t] for t in range(self.num_iterations))
-        entropy = -sum(q * torch.log(q + 1e-8) for q in q_probs)
-
-        combined_loss = weighted_loss - self.entropy_beta * entropy
+        # Simple: loss = final iteration's CE loss only
+        # Gradients flow through all iterations via weight sharing
+        final_loss = step_losses[-1]
         step_losses_detached = [l.detach() for l in step_losses]
-        q_probs_detached = [q.detach() for q in q_probs]
-        entropy_detached = entropy.detach()
-        return combined_loss, step_losses_detached, q_probs_detached, entropy_detached
+        return final_loss, step_losses_detached
 
 
 # -----------------------------
@@ -912,7 +878,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        entropy_beta=args.entropy_beta,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -939,11 +904,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    # Add exit gate params to scalar optimizer
-    for p in base_model.exit_gates:
-        scalar_params.append(p)
-    for p in base_model.gate_bias:
-        scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1094,8 +1054,6 @@ def main() -> None:
         zero_grad_all()
         train_loss_accum: float = 0.0
         iter_losses_accum: list[float] = [0.0] * args.num_iterations
-        q_probs_accum: list[float] = [0.0] * args.num_iterations
-        entropy_accum: float = 0.0
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1103,20 +1061,15 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 result = model(x, y)
                 if isinstance(result, tuple):
-                    loss, iter_losses, q_probs, ent = result
+                    loss, iter_losses = result
                     for i, il in enumerate(iter_losses):
                         iter_losses_accum[i] += il.item()
-                    for i, qp in enumerate(q_probs):
-                        q_probs_accum[i] += qp.item()
-                    entropy_accum += ent.item()
                 else:
                     loss = result
             train_loss_accum += loss.detach().item()
             (loss * grad_scale).backward()
         train_loss_accum /= grad_accum_steps
         iter_losses_accum = [v / grad_accum_steps for v in iter_losses_accum]
-        q_probs_accum = [v / grad_accum_steps for v in q_probs_accum]
-        entropy_accum /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1141,10 +1094,9 @@ def main() -> None:
         )
         if should_log_train:
             iter_str = " ".join(f"iter{i}:{v:.4f}" for i, v in enumerate(iter_losses_accum))
-            q_str = " ".join(f"q{i}:{v:.3f}" for i, v in enumerate(q_probs_accum))
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_accum:.4f} "
-                f"{iter_str} {q_str} entropy:{entropy_accum:.4f} "
+                f"{iter_str} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
