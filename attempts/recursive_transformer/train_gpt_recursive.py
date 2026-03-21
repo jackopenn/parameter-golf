@@ -278,7 +278,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,iter_gate,delta_scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,delta_scale",
     ).split(",")
     if pattern
 )
@@ -721,9 +721,6 @@ class RecursiveGPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
 
-        # Per-iteration gate: learned scalar that controls how much each iteration contributes
-        self.iter_gate = nn.Parameter(torch.ones(num_iterations, dtype=torch.float32))
-
         self.blocks = nn.ModuleList([
             RecursiveBlock(
                 model_dim, num_heads, num_kv_heads, mlp_mult,
@@ -941,9 +938,6 @@ def main() -> None:
 
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    if base_model.iter_gate.numel() > 0:
-        scalar_params.append(base_model.iter_gate)
-
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
