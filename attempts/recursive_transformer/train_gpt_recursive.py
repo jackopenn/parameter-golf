@@ -960,15 +960,14 @@ def main() -> None:
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
 
-    # Delta matrices get their own Muon optimizer
-    optimizer_delta = Muon(
-        delta_matrix_params,
-        lr=args.delta_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
+    # Delta matrices are 3D (num_iterations, out, rank) so use Adam, not Muon
+    # (Muon's Newton-Schulz orthogonalization only works on 2D matrices)
+    optimizer_delta = torch.optim.Adam(
+        [{"params": delta_matrix_params, "lr": args.delta_lr, "base_lr": args.delta_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
     )
-    for group in optimizer_delta.param_groups:
-        group["base_lr"] = args.delta_lr
 
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
@@ -1106,9 +1105,8 @@ def main() -> None:
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for opt in [optimizer_muon, optimizer_delta]:
-            for group in opt.param_groups:
-                group["momentum"] = muon_momentum
+        for group in optimizer_muon.param_groups:
+            group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
