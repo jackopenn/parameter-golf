@@ -1088,7 +1088,7 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
-        train_loss = torch.zeros((), device=device)
+        train_loss_accum: float = 0.0
         iter_losses_accum: list[float] = [0.0] * args.num_iterations
         q_probs_accum: list[float] = [0.0] * args.num_iterations
         entropy_accum: float = 0.0
@@ -1107,9 +1107,9 @@ def main() -> None:
                     entropy_accum += ent.item()
                 else:
                     loss = result
-            train_loss += loss.detach()
+            train_loss_accum += loss.detach().item()
             (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
+        train_loss_accum /= grad_accum_steps
         iter_losses_accum = [v / grad_accum_steps for v in iter_losses_accum]
         q_probs_accum = [v / grad_accum_steps for v in q_probs_accum]
         entropy_accum /= grad_accum_steps
@@ -1139,7 +1139,7 @@ def main() -> None:
             iter_str = " ".join(f"iter{i}:{v:.4f}" for i, v in enumerate(iter_losses_accum))
             q_str = " ".join(f"q{i}:{v:.3f}" for i, v in enumerate(q_probs_accum))
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"step:{step}/{args.iterations} train_loss:{train_loss_accum:.4f} "
                 f"{iter_str} {q_str} entropy:{entropy_accum:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
