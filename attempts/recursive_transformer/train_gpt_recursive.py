@@ -83,6 +83,11 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     delta_lr = float(os.environ.get("DELTA_LR", 0.04))  # LR for low-rank deltas
+    # Staged training: train base weights first (phase 1), then freeze base and train deltas (phase 2).
+    # DELTA_PHASE2_FRAC controls when phase 2 starts (fraction of wallclock or iterations).
+    # Set to 1.0 to disable staged training (train everything together, not recommended).
+    # Set to 0.0 to only train deltas (requires pre-trained base weights).
+    delta_phase2_frac = float(os.environ.get("DELTA_PHASE2_FRAC", 0.7))  # Phase 2 starts at 70% of training
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -898,7 +903,8 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    # find_unused_parameters=True needed for staged training (phase 1 freezes deltas, phase 2 freezes base)
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=True) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -997,6 +1003,43 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"staged_training: delta_phase2_frac={args.delta_phase2_frac}")
+
+    # -----------------------------
+    # STAGED TRAINING SETUP
+    # -----------------------------
+    # Phase 1: Train base weights only (deltas frozen at zero).
+    # Phase 2: Freeze base weights, train deltas only (adds iteration diversity).
+    # This avoids Muon/Adam optimizer interference that kills training.
+
+    in_phase2 = False
+
+    def enter_phase2() -> None:
+        nonlocal in_phase2
+        if in_phase2:
+            return
+        in_phase2 = True
+        log0("=== ENTERING PHASE 2: freezing base weights, training deltas ===")
+        # Freeze base weights and all non-delta params
+        for name, p in base_model.named_parameters():
+            if ".deltas." not in name:
+                p.requires_grad_(False)
+        # Unfreeze delta params
+        for name, p in base_model.named_parameters():
+            if ".deltas." in name:
+                p.requires_grad_(True)
+
+    # If phase2_frac <= 0, start in phase 2 immediately
+    if args.delta_phase2_frac <= 0.0:
+        enter_phase2()
+    # If phase2_frac >= 1.0, never enter phase 2 (train everything together)
+    # Otherwise, phase 2 starts at delta_phase2_frac of the training budget
+
+    # In phase 1, freeze deltas so they don't interfere
+    if not in_phase2 and args.delta_phase2_frac < 1.0:
+        for name, p in base_model.named_parameters():
+            if ".deltas." in name:
+                p.requires_grad_(False)
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1084,6 +1127,19 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+
+        # Check if it's time to transition to phase 2 (freeze base, train deltas)
+        if not in_phase2 and 0.0 < args.delta_phase2_frac < 1.0:
+            if max_wallclock_ms is not None:
+                should_switch = elapsed_ms >= max_wallclock_ms * args.delta_phase2_frac
+            else:
+                should_switch = step >= int(args.iterations * args.delta_phase2_frac)
+            if should_switch:
+                enter_phase2()
+                # Need to recompile after changing requires_grad
+                compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+                model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
