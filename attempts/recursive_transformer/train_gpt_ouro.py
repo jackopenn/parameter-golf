@@ -261,10 +261,9 @@ def eval_val(
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 result = model(x, y)
-                # forward returns (combined_loss, iter_losses, q_probs, entropy) tuple; use last iteration's loss for val
+                # forward returns (final_loss, iter_losses) tuple; use final loss for val
                 if isinstance(result, tuple):
-                    _, iter_losses, _, _ = result
-                    batch_loss = iter_losses[-1].detach()
+                    batch_loss = result[0].detach()
                 else:
                     batch_loss = result.detach()
             batch_token_count = float(y.numel())
