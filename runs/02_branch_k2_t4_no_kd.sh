@@ -10,8 +10,8 @@ export SEED="${SEED:-1337}"
 export BRANCH_TAIL_LAYERS="${BRANCH_TAIL_LAYERS:-2}"
 export TEACHER_MLP_MULT="${TEACHER_MLP_MULT:-4}"
 export KD_WEIGHT_MAX="${KD_WEIGHT_MAX:-0.0}"
-export PHASE_A_STEPS="${PHASE_A_STEPS:-0}"
-export PHASE_B_STEPS="${PHASE_B_STEPS:-0}"
-export PHASE_D_STEPS="${PHASE_D_STEPS:-0}"
+export PHASE_A_FRAC="${PHASE_A_FRAC:-0.0}"
+export PHASE_B_FRAC="${PHASE_B_FRAC:-0.0}"
+export PHASE_D_FRAC="${PHASE_D_FRAC:-0.0}"
 
 run_experiment

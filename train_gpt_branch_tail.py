@@ -28,6 +28,13 @@ def env_flag(name: str, default: bool = False) -> bool:
     return bool(int(os.environ.get(name, "1" if default else "0")))
 
 
+def env_fraction(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is not None:
+        return float(raw)
+    return default
+
+
 class Hyperparameters:
     single_h100_30m = env_flag("SINGLE_H100_30M", False)
 
@@ -85,9 +92,9 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     kd_temperature = float(os.environ.get("KD_TEMPERATURE", 2.0))
     kd_weight_max = float(os.environ.get("KD_WEIGHT_MAX", 0.5))
-    phase_a_steps = int(os.environ.get("PHASE_A_STEPS", 400))
-    phase_b_steps = int(os.environ.get("PHASE_B_STEPS", 800))
-    phase_d_steps = int(os.environ.get("PHASE_D_STEPS", 800))
+    phase_a_frac = env_fraction("PHASE_A_FRAC", 0.10)
+    phase_b_frac = env_fraction("PHASE_B_FRAC", 0.20)
+    phase_d_frac = env_fraction("PHASE_D_FRAC", 0.20)
 
     # Logging.
     wandb_enable = env_flag("WANDB_ENABLE", False)
@@ -529,17 +536,39 @@ def wandb_log(run, metrics: dict[str, object], *, step: int) -> None:
         run.log(metrics, step=step)
 
 
-def training_phase(args: Hyperparameters, step: int) -> tuple[str, float, float, float, bool]:
+def validate_schedule(args: Hyperparameters) -> None:
+    for name in ("phase_a_frac", "phase_b_frac", "phase_d_frac"):
+        value = getattr(args, name)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name.upper()} must be in [0, 1], got {value}")
+    if args.phase_a_frac + args.phase_b_frac > 1.0:
+        raise ValueError(
+            "PHASE_A_FRAC + PHASE_B_FRAC must be <= 1.0 so the timed schedule fits inside the run budget; "
+            f"got {args.phase_a_frac + args.phase_b_frac:.4f}"
+        )
+
+
+def schedule_progress(args: Hyperparameters, step: int, elapsed_ms: float, max_wallclock_ms: float | None) -> float:
+    if max_wallclock_ms is not None and max_wallclock_ms > 0.0:
+        return min(max(elapsed_ms / max_wallclock_ms, 0.0), 1.0)
+    return min(step / max(args.iterations, 1), 1.0)
+
+
+def training_phase(
+    args: Hyperparameters, step: int, elapsed_ms: float, max_wallclock_ms: float | None
+) -> tuple[str, float, float, float, bool, float]:
     if args.branch_tail_layers <= 0:
-        return "baseline", 1.0, 0.0, 0.0, False
-    phase_d_start = max(args.phase_a_steps + args.phase_b_steps, args.iterations - args.phase_d_steps)
-    if step < args.phase_a_steps:
-        return "teacher_warmup", 0.0, 1.0, 0.0, True
-    if step < args.phase_a_steps + args.phase_b_steps:
-        return "student_onboarding", 1.0, 1.0, 0.25 * args.kd_weight_max, True
-    if step < phase_d_start:
-        return "joint", 1.0, 1.0, args.kd_weight_max, True
-    return "student_consolidation", 1.0, 0.0, 0.0, False
+        return "baseline", 1.0, 0.0, 0.0, False, schedule_progress(args, step, elapsed_ms, max_wallclock_ms)
+    progress = schedule_progress(args, step, elapsed_ms, max_wallclock_ms)
+    phase_b_end = args.phase_a_frac + args.phase_b_frac
+    phase_d_start = max(phase_b_end, 1.0 - args.phase_d_frac)
+    if progress < args.phase_a_frac:
+        return "teacher_warmup", 0.0, 1.0, 0.0, True, progress
+    if progress < phase_b_end:
+        return "student_onboarding", 1.0, 1.0, 0.25 * args.kd_weight_max, True, progress
+    if progress < phase_d_start:
+        return "joint", 1.0, 1.0, args.kd_weight_max, True, progress
+    return "student_consolidation", 1.0, 0.0, 0.0, False, progress
 
 
 class RMSNorm(nn.Module):
@@ -979,6 +1008,7 @@ def main() -> None:
         )
     if args.branch_tail_layers < 0:
         raise ValueError(f"BRANCH_TAIL_LAYERS must be non-negative, got {args.branch_tail_layers}")
+    validate_schedule(args)
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -1135,6 +1165,10 @@ def main() -> None:
         f"branch_tail_layers:{args.branch_tail_layers} teacher_mlp_mult:{args.teacher_mlp_mult}"
     )
     log0(
+        f"phase_a_frac:{args.phase_a_frac:.3f} phase_b_frac:{args.phase_b_frac:.3f} "
+        f"phase_d_frac:{args.phase_d_frac:.3f}"
+    )
+    log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
@@ -1153,6 +1187,9 @@ def main() -> None:
             "grad_accum_steps": grad_accum_steps,
             "branch_tail_layers": args.branch_tail_layers,
             "teacher_mlp_mult": args.teacher_mlp_mult,
+            "phase_a_frac": args.phase_a_frac,
+            "phase_b_frac": args.phase_b_frac,
+            "phase_d_frac": args.phase_d_frac,
         },
         step=0,
     )
@@ -1266,7 +1303,12 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        phase_name, student_ce_weight, teacher_ce_weight, kd_weight, teacher_enabled = training_phase(args, step)
+        phase_name, student_ce_weight, teacher_ce_weight, kd_weight, teacher_enabled, phase_progress = training_phase(
+            args,
+            step,
+            elapsed_ms,
+            max_wallclock_ms,
+        )
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         student_ce_value = torch.zeros((), device=device)
@@ -1327,7 +1369,7 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} phase:{phase_name} train_loss:{train_loss.item():.4f} "
                 f"student_ce:{student_ce_value.item():.4f} teacher_ce:{teacher_ce_value.item():.4f} "
-                f"kd_kl:{kd_kl_value.item():.4f} train_time:{approx_training_time_ms:.0f}ms "
+                f"kd_kl:{kd_kl_value.item():.4f} phase_progress:{phase_progress:.3f} train_time:{approx_training_time_ms:.0f}ms "
                 f"step_avg:{approx_training_time_ms / step:.2f}ms tokens_per_sec:{tokens_per_sec:.0f}"
             )
             wandb_log(
@@ -1339,6 +1381,7 @@ def main() -> None:
                     "teacher_ce": float(teacher_ce_value.item()),
                     "kd_kl": float(kd_kl_value.item()),
                     "kd_weight": kd_weight,
+                    "phase_progress": float(phase_progress),
                     "train_time_ms": float(approx_training_time_ms),
                     "step_avg_ms": float(approx_training_time_ms / step),
                     "tokens_per_sec": float(tokens_per_sec),

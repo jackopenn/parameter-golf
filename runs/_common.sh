@@ -24,9 +24,9 @@ export WARMUP_STEPS="${WARMUP_STEPS:-20}"
 
 export KD_TEMPERATURE="${KD_TEMPERATURE:-2.0}"
 export KD_WEIGHT_MAX="${KD_WEIGHT_MAX:-0.5}"
-export PHASE_A_STEPS="${PHASE_A_STEPS:-400}"
-export PHASE_B_STEPS="${PHASE_B_STEPS:-800}"
-export PHASE_D_STEPS="${PHASE_D_STEPS:-800}"
+export PHASE_A_FRAC="${PHASE_A_FRAC:-0.10}"
+export PHASE_B_FRAC="${PHASE_B_FRAC:-0.20}"
+export PHASE_D_FRAC="${PHASE_D_FRAC:-0.20}"
 
 run_experiment() {
   python3 train_gpt_branch_tail.py "$@"
