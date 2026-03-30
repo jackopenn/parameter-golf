@@ -1444,8 +1444,56 @@ def main() -> None:
 
     if distributed:
         dist.barrier()
+    torch.cuda.synchronize()
+    t_base_eval = time.perf_counter()
+    base_val_loss, base_val_bpb = eval_val(
+        args,
+        base_model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(
+        f"final_base_model val_loss:{base_val_loss:.4f} val_bpb:{base_val_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_base_eval):.0f}ms"
+    )
+    wandb_log(
+        wandb_run,
+        {
+            "final_base_val_loss": float(base_val_loss),
+            "final_base_val_bpb": float(base_val_bpb),
+            "final_base_eval_time_ms": float(1000.0 * (time.perf_counter() - t_base_eval)),
+        },
+        step=step,
+    )
+
     export_eval_model = build_student_model(args, device)
     export_eval_model.load_state_dict({name: tensor.detach().to(device="cpu") for name, tensor in export_state.items()}, strict=True)
+    if master_process:
+        loaded_export_state = export_eval_model.state_dict()
+        max_export_param_abs_diff = 0.0
+        max_export_param_name = ""
+        for name, tensor in export_state.items():
+            diff = (
+                tensor.detach().float().cpu() - loaded_export_state[name].detach().float().cpu()
+            ).abs().max().item()
+            if diff > max_export_param_abs_diff:
+                max_export_param_abs_diff = float(diff)
+                max_export_param_name = name
+        log0(f"final_export_reload max_param_abs_diff:{max_export_param_abs_diff:.8g} name:{max_export_param_name}")
+        wandb_log(
+            wandb_run,
+            {
+                "final_export_param_max_abs_diff": max_export_param_abs_diff,
+            },
+            step=step,
+        )
     torch.cuda.synchronize()
     t_export_eval = time.perf_counter()
     export_val_loss, export_val_bpb = eval_val(
