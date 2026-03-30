@@ -1442,6 +1442,40 @@ def main() -> None:
             step=step,
         )
 
+    if distributed:
+        dist.barrier()
+    export_eval_model = build_student_model(args, device)
+    export_eval_model.load_state_dict({name: tensor.detach().to(device="cpu") for name, tensor in export_state.items()}, strict=True)
+    torch.cuda.synchronize()
+    t_export_eval = time.perf_counter()
+    export_val_loss, export_val_bpb = eval_val(
+        args,
+        export_eval_model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(
+        f"final_export_student val_loss:{export_val_loss:.4f} val_bpb:{export_val_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_export_eval):.0f}ms"
+    )
+    wandb_log(
+        wandb_run,
+        {
+            "final_export_val_loss": float(export_val_loss),
+            "final_export_val_bpb": float(export_val_bpb),
+            "final_export_eval_time_ms": float(1000.0 * (time.perf_counter() - t_export_eval)),
+        },
+        step=step,
+    )
+    del export_eval_model
+
     quant_obj, quant_stats = quantize_state_dict_int8(export_state)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
