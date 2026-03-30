@@ -28,3 +28,11 @@ export KD_TEMPERATURE="${KD_TEMPERATURE:-2.0}"
 run_experiment() {
   python3 train_gpt_branch_tail.py "$@"
 }
+
+run_experiment_torchrun() {
+  torchrun \
+    --standalone \
+    --nnodes="${NNODES:-1}" \
+    --nproc_per_node="${NPROC_PER_NODE:-8}" \
+    train_gpt_branch_tail.py "$@"
+}
