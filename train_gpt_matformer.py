@@ -13,6 +13,7 @@ import sys
 import time
 import uuid
 import zlib
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -676,16 +677,28 @@ class NestedMLP(nn.Module):
             )
         self.small_hidden = small_mlp_mult * dim
         self.large_hidden = large_mlp_mult * dim
-        self.fc = CastedLinear(dim, self.large_hidden, bias=False)
-        self.proj = CastedLinear(self.large_hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.extra_hidden = self.large_hidden - self.small_hidden
+        self.fc_shared = CastedLinear(dim, self.small_hidden, bias=False)
+        self.proj_shared = CastedLinear(self.small_hidden, dim, bias=False)
+        self.proj_shared._zero_init = True
+        self.fc_extra = CastedLinear(dim, self.extra_hidden, bias=False) if self.extra_hidden > 0 else None
+        self.proj_extra = CastedLinear(self.extra_hidden, dim, bias=False) if self.extra_hidden > 0 else None
+        if self.proj_extra is not None:
+            self.proj_extra._zero_init = True
+
+    def forward_small(self, x: Tensor) -> Tensor:
+        x_small = torch.relu(self.fc_shared(x))
+        return self.proj_shared(x_small.square())
+
+    def forward_large(self, x: Tensor) -> Tensor:
+        out = self.forward_small(x)
+        if self.fc_extra is None or self.proj_extra is None:
+            return out
+        x_extra = torch.relu(self.fc_extra(x))
+        return out + self.proj_extra(x_extra.square())
 
     def forward(self, x: Tensor, *, use_small: bool) -> Tensor:
-        hidden = self.small_hidden if use_small else self.large_hidden
-        fc_weight = self.fc.weight[:hidden].to(dtype=x.dtype)
-        proj_weight = self.proj.weight[:, :hidden].to(dtype=x.dtype)
-        x = torch.relu(F.linear(x, fc_weight))
-        return F.linear(x.square(), proj_weight)
+        return self.forward_small(x) if use_small else self.forward_large(x)
 
 
 class Block(nn.Module):
@@ -917,15 +930,17 @@ class NestedGPT(nn.Module):
 
 
 def extract_small_model_state_dict(model: NestedGPT) -> dict[str, Tensor]:
-    state = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
-    for key, tensor in list(state.items()):
-        if ".mlp.fc.weight" in key:
-            small_hidden = model.blocks[int(key.split(".")[1])].mlp.small_hidden
-            state[key] = tensor[:small_hidden].contiguous()
-        elif ".mlp.proj.weight" in key:
-            small_hidden = model.blocks[int(key.split(".")[1])].mlp.small_hidden
-            state[key] = tensor[:, :small_hidden].contiguous()
-    return state
+    export_state: dict[str, Tensor] = {}
+    for key, tensor in model.state_dict().items():
+        if ".mlp.fc_shared.weight" in key:
+            export_state[key.replace(".mlp.fc_shared.weight", ".mlp.fc.weight")] = tensor.detach().cpu().clone()
+        elif ".mlp.proj_shared.weight" in key:
+            export_state[key.replace(".mlp.proj_shared.weight", ".mlp.proj.weight")] = tensor.detach().cpu().clone()
+        elif ".mlp.fc_extra.weight" in key or ".mlp.proj_extra.weight" in key:
+            continue
+        else:
+            export_state[key] = tensor.detach().cpu().clone()
+    return export_state
 
 
 def validate_matformer_args(args: Hyperparameters) -> None:
@@ -935,6 +950,23 @@ def validate_matformer_args(args: Hyperparameters) -> None:
         )
     if not 0.0 <= args.large_sample_prob <= 1.0:
         raise ValueError(f"LARGE_SAMPLE_PROB must be in [0, 1], got {args.large_sample_prob}")
+
+
+def build_large_step_cycle(prob: float, *, max_denominator: int = 16) -> list[bool]:
+    frac = Fraction(prob).limit_denominator(max_denominator)
+    num_large = frac.numerator
+    den = frac.denominator
+    if num_large <= 0:
+        return [False]
+    if num_large >= den:
+        return [True]
+    cycle: list[bool] = []
+    prev = 0
+    for i in range(1, den + 1):
+        curr = (i * num_large) // den
+        cycle.append(curr > prev)
+        prev = curr
+    return cycle
 
 
 # -----------------------------
@@ -1047,8 +1079,25 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.use_compile else base_model
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    if distributed:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.use_compile else base_model
+        model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+        loss_fn_small = lambda x, y: model(x, y, use_small=True)
+        loss_fn_large = lambda x, y: model(x, y, use_small=False)
+    else:
+        model = base_model
+        if args.use_compile:
+            def loss_fn_small(x: Tensor, y: Tensor) -> Tensor:
+                return base_model(x, y, use_small=True)
+
+            def loss_fn_large(x: Tensor, y: Tensor) -> Tensor:
+                return base_model(x, y, use_small=False)
+
+            loss_fn_small = torch.compile(loss_fn_small, dynamic=False, fullgraph=True)
+            loss_fn_large = torch.compile(loss_fn_large, dynamic=False, fullgraph=True)
+        else:
+            loss_fn_small = lambda x, y: base_model(x, y, use_small=True)
+            loss_fn_large = lambda x, y: base_model(x, y, use_small=False)
 
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
@@ -1116,6 +1165,10 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    large_step_cycle = build_large_step_cycle(args.large_sample_prob)
+    log0(
+        "large_step_cycle:" + "".join("L" if use_large else "S" for use_large in large_step_cycle)
+    )
     wandb_log(
         wandb_run,
         {
@@ -1125,6 +1178,7 @@ def main() -> None:
             "small_mlp_mult": float(args.mlp_mult),
             "large_mlp_mult": float(args.large_mlp_mult),
             "large_sample_prob": float(args.large_sample_prob),
+            "large_step_cycle_len": float(len(large_step_cycle)),
         },
         step=0,
     )
@@ -1155,14 +1209,14 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
-            use_small = (warmup_step % 2) == 0
+            use_large = large_step_cycle[warmup_step % len(large_step_cycle)]
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y, use_small=use_small)
+                    warmup_loss = loss_fn_large(x, y) if use_large else loss_fn_small(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1244,8 +1298,8 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        use_small = random.random() >= args.large_sample_prob
-        last_large_step = 0.0 if use_small else 1.0
+        use_large = large_step_cycle[step % len(large_step_cycle)]
+        last_large_step = 1.0 if use_large else 0.0
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1253,7 +1307,7 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y, use_small=use_small)
+                loss = loss_fn_large(x, y) if use_large else loss_fn_small(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1280,7 +1334,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"use_small:{int(use_small)} train_time:{approx_training_time_ms:.0f}ms "
+                f"use_large:{int(use_large)} train_time:{approx_training_time_ms:.0f}ms "
                 f"step_avg:{approx_training_time_ms / step:.2f}ms"
             )
             wandb_log(
