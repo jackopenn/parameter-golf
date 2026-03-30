@@ -546,20 +546,26 @@ def validate_schedule(args: Hyperparameters) -> None:
             "PHASE_A_FRAC + PHASE_B_FRAC must be <= 1.0 so the timed schedule fits inside the run budget; "
             f"got {args.phase_a_frac + args.phase_b_frac:.4f}"
         )
+    if args.branch_tail_layers > 0 and args.max_wallclock_seconds <= 0.0:
+        raise ValueError(
+            "Branched-tail schedule phases are wall-clock-driven and require MAX_WALLCLOCK_SECONDS > 0; "
+            f"got {args.max_wallclock_seconds}"
+        )
 
 
-def schedule_progress(args: Hyperparameters, step: int, elapsed_ms: float, max_wallclock_ms: float | None) -> float:
-    if max_wallclock_ms is not None and max_wallclock_ms > 0.0:
-        return min(max(elapsed_ms / max_wallclock_ms, 0.0), 1.0)
-    return min(step / max(args.iterations, 1), 1.0)
+def schedule_progress(elapsed_ms: float, max_wallclock_ms: float) -> float:
+    return min(max(elapsed_ms / max_wallclock_ms, 0.0), 1.0)
 
 
 def training_phase(
     args: Hyperparameters, step: int, elapsed_ms: float, max_wallclock_ms: float | None
 ) -> tuple[str, float, float, float, bool, float]:
     if args.branch_tail_layers <= 0:
-        return "baseline", 1.0, 0.0, 0.0, False, schedule_progress(args, step, elapsed_ms, max_wallclock_ms)
-    progress = schedule_progress(args, step, elapsed_ms, max_wallclock_ms)
+        baseline_progress = schedule_progress(elapsed_ms, max_wallclock_ms) if max_wallclock_ms is not None else 0.0
+        return "baseline", 1.0, 0.0, 0.0, False, baseline_progress
+    if max_wallclock_ms is None or max_wallclock_ms <= 0.0:
+        raise RuntimeError("Branched-tail phases require a positive wall-clock budget")
+    progress = schedule_progress(elapsed_ms, max_wallclock_ms)
     phase_b_end = args.phase_a_frac + args.phase_b_frac
     phase_d_start = max(phase_b_end, 1.0 - args.phase_d_frac)
     if progress < args.phase_a_frac:

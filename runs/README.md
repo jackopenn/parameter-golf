@@ -23,6 +23,7 @@ Expected run order:
 Useful overrides:
 - `TRAIN_BATCH_TOKENS` to push H100 utilization.
 - `GRAD_ACCUM_STEPS` if you want a different microbatching regime.
+- `MAX_WALLCLOCK_SECONDS` to change the timed schedule budget. Branched-tail runs require this to stay positive.
 - `PHASE_A_FRAC`, `PHASE_B_FRAC`, and `PHASE_D_FRAC` to control timed teacher warmup, onboarding, and final student consolidation as fractions of the run budget.
 - `DATA_PATH`, `TOKENIZER_PATH`, and `VOCAB_SIZE` if your local dataset layout differs from repo defaults.
 - `WANDB_ENABLE=0` if you want to test locally without online logging.
