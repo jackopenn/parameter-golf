@@ -19,6 +19,7 @@ Expected run order:
 7. `07_branch_k1_t8_kd_consolidate.sh`
 8. `08_branch_k2_t4_kd_consolidate_no_warmup.sh`
 9. `09_branch_k2_t8_kd_consolidate_seed2024.sh`
+10. `10_baseline_18l_seed1337.sh`
 
 Useful overrides:
 - `TRAIN_BATCH_TOKENS` to push H100 utilization.
