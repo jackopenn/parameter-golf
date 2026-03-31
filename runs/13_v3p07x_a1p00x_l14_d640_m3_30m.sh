@@ -10,6 +10,5 @@ export HYPER_K=10
 export HYPER_S=12
 export LORA_RANK=2
 export HYPER_BASIS_GROUP_SIZE=1
-export TRAIN_BATCH_TOKENS=131072
 
 exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_launch_virtual_budget_h10030.sh" v3p07x_a1p00x_l14_d640_m3_30m

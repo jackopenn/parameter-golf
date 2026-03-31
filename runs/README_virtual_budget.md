@@ -72,16 +72,13 @@ actual_params =
 
 ## Runtime Notes
 
-These are more compute-heavy than baseline because the virtual model is larger.
+These runs now keep the same batch size as the dense baseline:
 
-The launchers therefore reduce `TRAIN_BATCH_TOKENS` as virtual size rises:
+- `TRAIN_BATCH_TOKENS=393216`
 
-- `11`: `196608`
-- `12`: `147456`
-- `13`: `131072`
-- `14`: `98304`
-- `15`: `81920`
-- `16`: `81920`
+So the comparison is cleaner: the main change is model shape and factorized parameterization, not token budget per step.
+
+The tradeoff is that the larger virtual models may run slower or hit memory limits sooner than the earlier reduced-batch versions.
 
 ## W&B
 
