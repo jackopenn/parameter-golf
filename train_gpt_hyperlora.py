@@ -1,4 +1,4 @@
-"""HyperLoRA training script for Parameter Golf.
+"""Grouped-basis HyperLoRA training script for Parameter Golf.
 W_{l,m} = Σ_k α_k · P_k · Q_k^T + λ · A · B^T. Set HYPER_MODE=dense for baseline."""
 
 from __future__ import annotations
@@ -23,6 +23,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 # HYPERPARAMETERS
 
@@ -80,15 +85,52 @@ class Hyperparameters:
     hyper_mode = os.environ.get("HYPER_MODE", "hyper_plus_lora")  # dense, hyper_plus_lora, hyper_only, lora_only
     hyper_K = int(os.environ.get("HYPER_K", 24))                  # number of basis components
     hyper_s = int(os.environ.get("HYPER_S", 12))                  # rank per basis component
-    hyper_embed_dim = int(os.environ.get("HYPER_EMBED_DIM", 64))  # conditioning embedding dim
-    hyper_hidden_dim = int(os.environ.get("HYPER_HIDDEN_DIM", 128))  # hypernet MLP hidden dim
-    hyper_lr = float(os.environ.get("HYPER_LR", 0.001))           # hypernet learning rate
+    basis_group_size = int(os.environ.get("HYPER_BASIS_GROUP_SIZE", 3))  # layers per shared basis bank
+    alpha_lr = float(os.environ.get("ALPHA_LR", os.environ.get("HYPER_LR", 0.001)))  # alpha coefficient LR
     lora_rank = int(os.environ.get("LORA_RANK", 16))              # LoRA adapter rank
     lora_alpha = float(os.environ.get("LORA_ALPHA", 16.0))        # LoRA scaling factor
     lora_lr = float(os.environ.get("LORA_LR", 0.04))             # LoRA learning rate
     train_strategy = os.environ.get("TRAIN_STRATEGY", "joint")    # joint, phased, hyper_first, lora_first
     phase1_frac = float(os.environ.get("PHASE1_FRAC", 0.2))      # fraction of training for phase 1
     phase2_frac = float(os.environ.get("PHASE2_FRAC", 0.7))      # fraction of training for phase 2
+    export_mode = os.environ.get("EXPORT_MODE", "factored")  # factored, dense_baseline
+
+    # Optional W&B logging.
+    wandb_project = os.environ.get("WANDB_PROJECT", "")
+    wandb_entity = os.environ.get("WANDB_ENTITY", "")
+    wandb_run_name = os.environ.get("WANDB_RUN_NAME", "")
+    wandb_group = os.environ.get("WANDB_GROUP", "")
+    wandb_tags = os.environ.get("WANDB_TAGS", "")
+    wandb_mode = os.environ.get("WANDB_MODE", "online")
+
+
+def hyperparameters_to_dict(args: Hyperparameters) -> dict[str, object]:
+    return {
+        name: getattr(args, name)
+        for name, value in vars(Hyperparameters).items()
+        if not name.startswith("_") and not callable(value)
+    }
+
+
+def init_wandb_run(args: Hyperparameters, master_process: bool, log0) -> object | None:
+    if not master_process or not args.wandb_project:
+        return None
+    if wandb is None:
+        raise ImportError(
+            "WANDB_PROJECT is set but wandb is not installed. Install requirements.txt before enabling W&B logging."
+        )
+    tags = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity or None,
+        name=args.wandb_run_name or args.run_id,
+        group=args.wandb_group or None,
+        tags=tags or None,
+        mode=args.wandb_mode,
+        config=hyperparameters_to_dict(args),
+    )
+    log0(f"wandb:enabled project:{args.wandb_project} run_id:{run.id}")
+    return run
 
 # MUON OPTIMIZER (from modded-nanogpt)
 
@@ -553,17 +595,6 @@ class SharedBasis(nn.Module):
         return P, Q
 
 
-class HyperNet(nn.Module):
-    """Tiny MLP: conditioning embedding z -> K mixing coefficients alpha."""
-    def __init__(self, embed_dim: int, hidden_dim: int, K: int):
-        super().__init__()
-        self.fc1 = nn.Linear(embed_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, K)
-
-    def forward(self, z: Tensor) -> Tensor:
-        return self.fc2(F.gelu(self.fc1(z)))
-
-
 class HyperLoRALinear(nn.Module):
     """Drop-in replacement for CastedLinear. W = Σ_k α_k P_k Q_k^T + λ A B^T."""
     def __init__(
@@ -571,8 +602,6 @@ class HyperLoRALinear(nn.Module):
         out_dim: int,
         in_dim: int,
         basis: SharedBasis,
-        hypernet: HyperNet,
-        z: Tensor,
         lora_rank: int,
         lora_alpha: float,
         enable_lora: bool = True,
@@ -582,10 +611,6 @@ class HyperLoRALinear(nn.Module):
         self.out_dim = out_dim
         self.in_dim = in_dim
         self.basis = basis
-        self.hypernet = hypernet
-        # z is a slice of the shared z_embeds parameter — store as a buffer reference
-        # We'll pass it in during forward instead to keep torch.compile happy
-        self._z_idx: tuple[int, int] | None = None
         self.enable_lora = enable_lora
         self.enable_hyper = enable_hyper
         self.lora_alpha_value = lora_alpha
@@ -597,10 +622,17 @@ class HyperLoRALinear(nn.Module):
             self.lora_lambda = nn.Parameter(torch.tensor(0.0))
             nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
-    def materialize_weight(self, z: Tensor) -> Tensor:
-        W = torch.zeros(self.out_dim, self.in_dim, device=z.device, dtype=torch.float32)
+    def materialize_weight(self, alpha: Tensor | None = None) -> Tensor:
+        if alpha is not None:
+            device = alpha.device
+        elif self.enable_lora:
+            device = self.lora_A.device
+        else:
+            device = self.basis.P.device
+        W = torch.zeros(self.out_dim, self.in_dim, device=device, dtype=torch.float32)
         if self.enable_hyper:
-            alpha = self.hypernet(z)  # (K,)
+            if alpha is None:
+                raise ValueError("alpha is required when the shared-basis term is enabled")
             P, Q = self.basis.get_factors()  # (K, out, s), (K, in, s)
             W = torch.einsum('k, kos, kis -> oi', alpha, P, Q)
         if self.enable_lora:
@@ -608,8 +640,8 @@ class HyperLoRALinear(nn.Module):
             W = W + self.lora_lambda * scaling * (self.lora_A @ self.lora_B)
         return W
 
-    def forward(self, x: Tensor, z: Tensor) -> Tensor:
-        W = self.materialize_weight(z)
+    def forward(self, x: Tensor, alpha: Tensor | None = None) -> Tensor:
+        W = self.materialize_weight(alpha)
         return F.linear(x, W.to(x.dtype))
 
 
@@ -618,12 +650,11 @@ def _make_linear(out_dim: int, in_dim: int, hyper_cfg: dict | None, type_idx: in
     if hyper_cfg is None:
         linear = CastedLinear(in_dim, out_dim, bias=False)
         return linear
+    group_idx = hyper_cfg["layer_to_group"][layer_idx]
     return HyperLoRALinear(
         out_dim=out_dim,
         in_dim=in_dim,
-        basis=hyper_cfg["bases"][type_idx],
-        hypernet=hyper_cfg["hypernets"][type_idx],
-        z=hyper_cfg["z_embeds"],  # full tensor, indexed in forward
+        basis=hyper_cfg["bases"][group_idx][type_idx],
         lora_rank=hyper_cfg["lora_rank"],
         lora_alpha=hyper_cfg["lora_alpha"],
         enable_lora=hyper_cfg["enable_lora"],
@@ -665,12 +696,12 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor, z_block: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, alpha_block: Tensor | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         if self.hyper:
-            q = self.c_q(x, z_block[0]).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-            k = self.c_k(x, z_block[1]).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            v = self.c_v(x, z_block[2]).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            q = self.c_q(x, alpha_block[0]).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+            k = self.c_k(x, alpha_block[1]).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = self.c_v(x, alpha_block[2]).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         else:
             q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
             k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -686,7 +717,7 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y, z_block[3]) if self.hyper else self.proj(y)
+        return self.proj(y, alpha_block[3]) if self.hyper else self.proj(y)
 
 
 class MLP(nn.Module):
@@ -700,10 +731,10 @@ class MLP(nn.Module):
         if not self.hyper:
             self.proj._zero_init = True
 
-    def forward(self, x: Tensor, z_block: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, alpha_block: Tensor | None = None) -> Tensor:
         if self.hyper:
-            x = torch.relu(self.fc(x, z_block[4]))
-            return self.proj(x.square(), z_block[5])
+            x = torch.relu(self.fc(x, alpha_block[4]))
+            return self.proj(x.square(), alpha_block[5])
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
@@ -731,12 +762,12 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, z_block: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, alpha_block: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x), z_block)
+        attn_out = self.attn(self.attn_norm(x), alpha_block)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), z_block)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), alpha_block)
         return x
 
 
@@ -748,6 +779,8 @@ def _build_hyper_cfg(args: Hyperparameters, model_dim: int, num_kv_heads: int, n
     """Build shared HyperLoRA components. Returns None for dense mode."""
     if args.hyper_mode == "dense":
         return None
+    if args.basis_group_size <= 0:
+        raise ValueError(f"HYPER_BASIS_GROUP_SIZE must be positive, got {args.basis_group_size}")
     kv_dim = num_kv_heads * (model_dim // num_heads)
     hidden = mlp_mult * model_dim
     # (out_dim, in_dim) for each of the 6 matrix types
@@ -759,24 +792,26 @@ def _build_hyper_cfg(args: Hyperparameters, model_dim: int, num_kv_heads: int, n
         (hidden, model_dim),     # mlp.fc
         (model_dim, hidden),     # mlp.proj
     ]
+    num_basis_groups = math.ceil(args.num_layers / args.basis_group_size)
+    layer_to_group = [min(layer_idx // args.basis_group_size, num_basis_groups - 1) for layer_idx in range(args.num_layers)]
     bases = nn.ModuleList([
-        SharedBasis(out_d, in_d, args.hyper_K, args.hyper_s)
-        for out_d, in_d in matrix_shapes
+        nn.ModuleList([
+            SharedBasis(out_d, in_d, args.hyper_K, args.hyper_s)
+            for out_d, in_d in matrix_shapes
+        ])
+        for _ in range(num_basis_groups)
     ])
-    hypernets = nn.ModuleList([
-        HyperNet(args.hyper_embed_dim, args.hyper_hidden_dim, args.hyper_K)
-        for _ in range(NUM_MATRIX_TYPES)
-    ])
-    # (num_layers, 6, embed_dim) conditioning embeddings
-    z_embeds = nn.Parameter(torch.randn(args.num_layers, NUM_MATRIX_TYPES, args.hyper_embed_dim) * 0.01)
+    # (num_layers, 6, K) direct mixing coefficients
+    alphas = nn.Parameter(torch.randn(args.num_layers, NUM_MATRIX_TYPES, args.hyper_K) / math.sqrt(args.hyper_K))
 
     enable_lora = args.hyper_mode in ("hyper_plus_lora", "lora_only")
     enable_hyper = args.hyper_mode in ("hyper_plus_lora", "hyper_only")
 
     return {
         "bases": bases,
-        "hypernets": hypernets,
-        "z_embeds": z_embeds,
+        "alphas": alphas,
+        "layer_to_group": tuple(layer_to_group),
+        "num_basis_groups": num_basis_groups,
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
         "enable_lora": enable_lora,
@@ -814,15 +849,17 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
 
-        # HyperLoRA shared components (None in dense mode)
+        # Grouped-basis HyperLoRA components (None in dense mode)
         if hyper_cfg is not None:
             self.bases = hyper_cfg["bases"]
-            self.hypernets = hyper_cfg["hypernets"]
-            self.z_embeds = hyper_cfg["z_embeds"]
+            self.alphas = hyper_cfg["alphas"]
+            self.layer_to_group = hyper_cfg["layer_to_group"]
+            self.num_basis_groups = hyper_cfg["num_basis_groups"]
         else:
             self.bases = None
-            self.hypernets = None
-            self.z_embeds = None
+            self.alphas = None
+            self.layer_to_group = None
+            self.num_basis_groups = 0
 
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base,
@@ -849,15 +886,15 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         for i in range(self.num_encoder_layers):
-            z_block = self.z_embeds[i] if self.hyper_mode else None  # (6, embed_dim)
-            x = self.blocks[i](x, x0, z_block)
+            alpha_block = self.alphas[i] if self.hyper_mode else None  # (6, K)
+            x = self.blocks[i](x, x0, alpha_block)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             block_idx = self.num_encoder_layers + i
-            z_block = self.z_embeds[block_idx] if self.hyper_mode else None
-            x = self.blocks[block_idx](x, x0, z_block)
+            alpha_block = self.alphas[block_idx] if self.hyper_mode else None
+            x = self.blocks[block_idx](x, x0, alpha_block)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -871,6 +908,181 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
+def init_gpt(args: Hyperparameters, device: torch.device | str, hyper_cfg: dict | None) -> GPT:
+    model = GPT(
+        vocab_size=args.vocab_size,
+        num_layers=args.num_layers,
+        model_dim=args.model_dim,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        mlp_mult=args.mlp_mult,
+        tie_embeddings=args.tie_embeddings,
+        tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base,
+        qk_gain_init=args.qk_gain_init,
+        hyper_cfg=hyper_cfg,
+    ).to(device).bfloat16()
+    for module in model.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    restore_low_dim_params_to_fp32(model)
+    return model
+
+
+def init_dense_gpt(args: Hyperparameters, device: torch.device | str) -> GPT:
+    return init_gpt(args, device, hyper_cfg=None)
+
+
+def init_hyper_gpt(args: Hyperparameters, device: torch.device | str) -> GPT:
+    hyper_cfg = _build_hyper_cfg(args, args.model_dim, args.num_kv_heads, args.num_heads, args.mlp_mult)
+    if hyper_cfg is None:
+        raise ValueError("init_hyper_gpt requires a non-dense HYPER_MODE")
+    return init_gpt(args, device, hyper_cfg=hyper_cfg)
+
+
+def _copy_tensor_(dst: Tensor, src: Tensor) -> None:
+    dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
+
+
+def _materialize_linear_weight(module: nn.Module, alpha: Tensor | None = None) -> Tensor:
+    if isinstance(module, HyperLoRALinear):
+        if alpha is None:
+            raise ValueError("alpha is required to materialize a HyperLoRALinear weight")
+        return module.materialize_weight(alpha).detach()
+    if isinstance(module, CastedLinear):
+        return module.weight.detach()
+    raise TypeError(f"Unsupported linear module type: {type(module)!r}")
+
+
+def build_factored_export_state_dict(base_model: GPT, args: Hyperparameters) -> dict[str, Tensor]:
+    export_sd: dict[str, Tensor] = {}
+    with torch.no_grad():
+        for group_idx, basis_group in enumerate(base_model.bases):
+            for type_idx, basis in enumerate(basis_group):
+                export_sd[f"basis.{group_idx}.{type_idx}.P"] = basis.P.detach().cpu()
+                export_sd[f"basis.{group_idx}.{type_idx}.Q"] = basis.Q.detach().cpu()
+        export_sd["layer_to_group"] = torch.tensor(base_model.layer_to_group, dtype=torch.int16)
+
+        for layer_idx in range(args.num_layers):
+            for type_idx in range(NUM_MATRIX_TYPES):
+                export_sd[f"alpha.{layer_idx}.{type_idx}"] = base_model.alphas[layer_idx, type_idx].detach().cpu()
+
+        for layer_idx, block in enumerate(base_model.blocks):
+            for name, module in block.named_modules():
+                if isinstance(module, HyperLoRALinear) and module.enable_lora:
+                    prefix = f"lora.{layer_idx}.{name}"
+                    export_sd[f"{prefix}.A"] = module.lora_A.detach().cpu()
+                    export_sd[f"{prefix}.B"] = module.lora_B.detach().cpu()
+                    export_sd[f"{prefix}.lambda"] = module.lora_lambda.detach().cpu()
+
+        export_sd["tok_emb.weight"] = base_model.tok_emb.weight.detach().cpu()
+        export_sd["skip_weights"] = base_model.skip_weights.detach().cpu()
+        for layer_idx, block in enumerate(base_model.blocks):
+            prefix = f"blocks.{layer_idx}"
+            export_sd[f"{prefix}.attn_scale"] = block.attn_scale.detach().cpu()
+            export_sd[f"{prefix}.mlp_scale"] = block.mlp_scale.detach().cpu()
+            export_sd[f"{prefix}.resid_mix"] = block.resid_mix.detach().cpu()
+            export_sd[f"{prefix}.q_gain"] = block.attn.q_gain.detach().cpu()
+        if base_model.lm_head is not None:
+            export_sd["lm_head.weight"] = base_model.lm_head.weight.detach().cpu()
+    return export_sd
+
+
+def load_factored_state_dict_into_model(model: GPT, state_dict: dict[str, Tensor], args: Hyperparameters, device: torch.device) -> None:
+    if not model.hyper_mode or model.bases is None or model.alphas is None:
+        raise ValueError("load_factored_state_dict_into_model requires a HyperLoRA model")
+    expected_layer_to_group = torch.tensor(model.layer_to_group, dtype=torch.int16)
+    if not torch.equal(state_dict["layer_to_group"].cpu().to(torch.int16), expected_layer_to_group):
+        raise ValueError("Factorized checkpoint layer grouping does not match current model config")
+
+    with torch.no_grad():
+        for group_idx, basis_group in enumerate(model.bases):
+            for type_idx, basis in enumerate(basis_group):
+                basis.P.data = state_dict[f"basis.{group_idx}.{type_idx}.P"].to(device, dtype=basis.P.dtype)
+                basis.Q.data = state_dict[f"basis.{group_idx}.{type_idx}.Q"].to(device, dtype=basis.Q.dtype)
+
+        model.alphas.data = torch.stack(
+            [
+                torch.stack(
+                    [state_dict[f"alpha.{layer_idx}.{type_idx}"] for type_idx in range(NUM_MATRIX_TYPES)],
+                    dim=0,
+                )
+                for layer_idx in range(args.num_layers)
+            ],
+            dim=0,
+        ).to(device, dtype=model.alphas.dtype)
+
+        model.tok_emb.weight.data = state_dict["tok_emb.weight"].to(device, dtype=model.tok_emb.weight.dtype)
+        model.skip_weights.data = state_dict["skip_weights"].to(device, dtype=model.skip_weights.dtype)
+        if model.lm_head is not None and "lm_head.weight" in state_dict:
+            model.lm_head.weight.data = state_dict["lm_head.weight"].to(device, dtype=model.lm_head.weight.dtype)
+
+        for layer_idx, block in enumerate(model.blocks):
+            prefix_b = f"blocks.{layer_idx}"
+            block.attn_scale.data = state_dict[f"{prefix_b}.attn_scale"].to(device, dtype=block.attn_scale.dtype)
+            block.mlp_scale.data = state_dict[f"{prefix_b}.mlp_scale"].to(device, dtype=block.mlp_scale.dtype)
+            block.resid_mix.data = state_dict[f"{prefix_b}.resid_mix"].to(device, dtype=block.resid_mix.dtype)
+            block.attn.q_gain.data = state_dict[f"{prefix_b}.q_gain"].to(device, dtype=block.attn.q_gain.dtype)
+
+            for name, module in block.named_modules():
+                if not isinstance(module, HyperLoRALinear) or not module.enable_lora:
+                    continue
+                prefix = f"lora.{layer_idx}.{name}"
+                if f"{prefix}.A" not in state_dict:
+                    continue
+                module.lora_A.data = state_dict[f"{prefix}.A"].to(device, dtype=module.lora_A.dtype)
+                module.lora_B.data = state_dict[f"{prefix}.B"].to(device, dtype=module.lora_B.dtype)
+                module.lora_lambda.data = state_dict[f"{prefix}.lambda"].to(device, dtype=module.lora_lambda.dtype)
+    model.eval()
+
+
+def build_dense_export_model(base_model: GPT, args: Hyperparameters) -> GPT:
+    """Fold HyperLoRA weights into a baseline-shaped dense GPT for export."""
+    export_model = init_dense_gpt(args, "cpu")
+    with torch.no_grad():
+        _copy_tensor_(export_model.tok_emb.weight, base_model.tok_emb.weight.detach().cpu())
+        if export_model.skip_weights.numel() > 0:
+            _copy_tensor_(export_model.skip_weights, base_model.skip_weights.detach().cpu())
+        if export_model.lm_head is not None and base_model.lm_head is not None:
+            _copy_tensor_(export_model.lm_head.weight, base_model.lm_head.weight.detach().cpu())
+
+        for layer_idx, (src_block, dst_block) in enumerate(zip(base_model.blocks, export_model.blocks, strict=True)):
+            alpha_block = base_model.alphas[layer_idx] if base_model.hyper_mode else None
+
+            _copy_tensor_(dst_block.attn_scale, src_block.attn_scale.detach().cpu())
+            _copy_tensor_(dst_block.mlp_scale, src_block.mlp_scale.detach().cpu())
+            _copy_tensor_(dst_block.resid_mix, src_block.resid_mix.detach().cpu())
+            _copy_tensor_(dst_block.attn.q_gain, src_block.attn.q_gain.detach().cpu())
+
+            _copy_tensor_(
+                dst_block.attn.c_q.weight,
+                _materialize_linear_weight(src_block.attn.c_q, None if alpha_block is None else alpha_block[0]).cpu(),
+            )
+            _copy_tensor_(
+                dst_block.attn.c_k.weight,
+                _materialize_linear_weight(src_block.attn.c_k, None if alpha_block is None else alpha_block[1]).cpu(),
+            )
+            _copy_tensor_(
+                dst_block.attn.c_v.weight,
+                _materialize_linear_weight(src_block.attn.c_v, None if alpha_block is None else alpha_block[2]).cpu(),
+            )
+            _copy_tensor_(
+                dst_block.attn.proj.weight,
+                _materialize_linear_weight(src_block.attn.proj, None if alpha_block is None else alpha_block[3]).cpu(),
+            )
+            _copy_tensor_(
+                dst_block.mlp.fc.weight,
+                _materialize_linear_weight(src_block.mlp.fc, None if alpha_block is None else alpha_block[4]).cpu(),
+            )
+            _copy_tensor_(
+                dst_block.mlp.proj.weight,
+                _materialize_linear_weight(src_block.mlp.proj, None if alpha_block is None else alpha_block[5]).cpu(),
+            )
+    export_model.eval()
+    return export_model
+
+
 # TRAINING
 
 def main() -> None:
@@ -878,6 +1090,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.export_mode not in ("dense_baseline", "factored"):
+        raise ValueError(f"Unsupported EXPORT_MODE={args.export_mode!r}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -932,6 +1146,7 @@ def main() -> None:
         console=False,
     )
     log0("=" * 100, console=False)
+    wandb_run = init_wandb_run(args, master_process, log0)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -955,7 +1170,7 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
-    # Build HyperLoRA shared components (None for dense mode)
+    # Build grouped-basis HyperLoRA components (None for dense mode)
     hyper_cfg = _build_hyper_cfg(args, args.model_dim, args.num_kv_heads, args.num_heads, args.mlp_mult)
 
     base_model = GPT(
@@ -1000,14 +1215,15 @@ def main() -> None:
         matrix_params = []  # dense block matrices (none in hyper mode)
         scalar_params = [
             p for name, p in block_named_params
-            if not any(sub in name for sub in ("basis.", "hypernet.", "lora_A", "lora_B", "lora_lambda"))
+            if not any(sub in name for sub in ("basis.", "lora_A", "lora_B", "lora_lambda"))
             and (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         ]
         # Basis P, Q params -> Muon (they are stored as 2D)
         basis_params = []
         if base_model.bases is not None:
-            for basis in base_model.bases:
-                basis_params.extend([basis.P, basis.Q])
+            for basis_group in base_model.bases:
+                for basis in basis_group:
+                    basis_params.extend([basis.P, basis.Q])
         # LoRA A, B params -> Muon
         lora_matrix_params = [
             p for name, p in block_named_params
@@ -1018,13 +1234,8 @@ def main() -> None:
             p for name, p in block_named_params if "lora_lambda" in name
         ]
         scalar_params.extend(lora_scalar_params)
-        # HyperNet MLP params + z_embeds -> Adam
-        hyper_params: list[nn.Parameter] = []
-        if base_model.hypernets is not None:
-            for hnet in base_model.hypernets:
-                hyper_params.extend(hnet.parameters())
-        if base_model.z_embeds is not None:
-            hyper_params.append(base_model.z_embeds)
+        # Direct alpha coefficients -> Adam
+        alpha_params: list[nn.Parameter] = [base_model.alphas] if base_model.alphas is not None else []
 
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1064,11 +1275,11 @@ def main() -> None:
         if optimizer_lora is not None:
             for group in optimizer_lora.param_groups:
                 group["base_lr"] = args.lora_lr
-        # HyperNet params via Adam
-        optimizer_hyper = torch.optim.Adam(
-            [{"params": hyper_params, "lr": args.hyper_lr, "base_lr": args.hyper_lr}],
+        # Alpha coefficient params via Adam
+        optimizer_alpha = torch.optim.Adam(
+            [{"params": alpha_params, "lr": args.alpha_lr, "base_lr": args.alpha_lr}],
             betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=False,
-        ) if hyper_params else None
+        ) if alpha_params else None
         # Scalar params via Adam
         optimizer_scalar = torch.optim.Adam(
             [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
@@ -1077,8 +1288,8 @@ def main() -> None:
         optimizers = [optimizer_tok, optimizer_basis, optimizer_scalar]
         if optimizer_lora is not None:
             optimizers.append(optimizer_lora)
-        if optimizer_hyper is not None:
-            optimizers.append(optimizer_hyper)
+        if optimizer_alpha is not None:
+            optimizers.append(optimizer_alpha)
 
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -1091,10 +1302,13 @@ def main() -> None:
     log0(f"hyper_mode:{args.hyper_mode}")
     if args.hyper_mode != "dense":
         n_train = n_params
-        # Count params that would be discarded (hypernets + z_embeds)
-        n_hyper_only = sum(p.numel() for p in hyper_params) if hyper_params else 0
+        n_hyper_only = 0
         log0(f"total_train_params:{n_train} stored_params:{n_train - n_hyper_only} discarded_params:{n_hyper_only}")
-        log0(f"hyper_K:{args.hyper_K} hyper_s:{args.hyper_s} lora_rank:{args.lora_rank}")
+        log0(
+            f"hyper_K:{args.hyper_K} hyper_s:{args.hyper_s} "
+            f"basis_group_size:{args.basis_group_size} basis_groups:{base_model.num_basis_groups} "
+            f"lora_rank:{args.lora_rank}"
+        )
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1104,12 +1318,21 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    if args.hyper_mode != "dense":
+        log0(f"alpha_lr:{args.alpha_lr} lora_lr:{args.lora_lr} basis_group_size:{args.basis_group_size}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if wandb_run is not None:
+        wandb_run.summary["model_params"] = n_params
+        wandb_run.summary["hyper_mode"] = args.hyper_mode
+        wandb_run.summary["export_mode"] = args.export_mode
+        if args.hyper_mode != "dense":
+            wandb_run.summary["stored_params"] = n_train - n_hyper_only
+            wandb_run.summary["discarded_params"] = n_hyper_only
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
@@ -1185,6 +1408,16 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "val/loss": val_loss,
+                        "val/bpb": val_bpb,
+                        "train/time_ms": training_time_ms,
+                        "train/step_avg_ms": training_time_ms / max(step, 1),
+                    },
+                    step=step,
+                )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1228,36 +1461,35 @@ def main() -> None:
             p2_end = args.phase1_frac + args.phase2_frac
             if args.train_strategy == "hyper_first":
                 if train_frac < p1_end:
-                    # Phase 1: freeze LoRA
+                    # Phase 1: shared basis + alpha only
                     if optimizer_lora is not None:
                         for group in optimizer_lora.param_groups:
                             group["lr"] = 0.0
-                # Phase 2+: everything trains (joint)
             elif args.train_strategy == "lora_first":
                 if train_frac < p1_end:
-                    # Phase 1: freeze hyper + basis
+                    # Phase 1: LoRA only
                     for group in optimizer_basis.param_groups:
                         group["lr"] = 0.0
-                    if optimizer_hyper is not None:
-                        for group in optimizer_hyper.param_groups:
+                    if optimizer_alpha is not None:
+                        for group in optimizer_alpha.param_groups:
                             group["lr"] = 0.0
             elif args.train_strategy == "phased":
                 if train_frac < p1_end:
-                    # Phase 1: hyper only
+                    # Phase 1: shared basis + alpha only
                     if optimizer_lora is not None:
                         for group in optimizer_lora.param_groups:
                             group["lr"] = 0.0
                 elif train_frac < p2_end:
-                    # Phase 2: joint (hyper LR reduced)
-                    if optimizer_hyper is not None:
-                        for group in optimizer_hyper.param_groups:
+                    # Phase 2: joint (alpha LR reduced)
+                    if optimizer_alpha is not None:
+                        for group in optimizer_alpha.param_groups:
                             group["lr"] = group["base_lr"] * scale * 0.1
                 else:
                     # Phase 3: LoRA only
                     for group in optimizer_basis.param_groups:
                         group["lr"] = 0.0
-                    if optimizer_hyper is not None:
-                        for group in optimizer_hyper.param_groups:
+                    if optimizer_alpha is not None:
+                        for group in optimizer_alpha.param_groups:
                             group["lr"] = 0.0
 
         if args.grad_clip_norm > 0:
@@ -1277,6 +1509,17 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "train/loss": train_loss.item(),
+                        "train/time_ms": approx_training_time_ms,
+                        "train/step_avg_ms": approx_training_time_ms / step,
+                        "lr/scale": scale,
+                        "optimizer/muon_momentum": muon_momentum,
+                    },
+                    step=step,
+                )
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1296,46 +1539,24 @@ def main() -> None:
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
 
-    if args.hyper_mode != "dense":
-        # Factored export: save basis, alpha coefficients, LoRA, and non-hyper params
+    qeval_model: nn.Module = base_model
+    if args.hyper_mode != "dense" and args.export_mode == "factored":
         log0("export_mode:factored")
-        export_sd: dict[str, Tensor] = {}
+        export_sd = build_factored_export_state_dict(base_model, args)
+        export_model_params = sum(t.numel() for name, t in export_sd.items() if name != "layer_to_group")
+        log0(f"export_model_params:{export_model_params}")
+        if wandb_run is not None:
+            wandb_run.summary["export_model_params"] = export_model_params
+            wandb_run.summary["train_to_export_param_ratio"] = n_params / max(export_model_params, 1)
 
-        # 1. Basis factors (per type)
-        with torch.no_grad():
-            for type_idx, basis in enumerate(base_model.bases):
-                export_sd[f"basis.{type_idx}.P"] = basis.P.detach().cpu()
-                export_sd[f"basis.{type_idx}.Q"] = basis.Q.detach().cpu()
+        if master_process:
+            torch.save(export_sd, "final_model.pt")
+            model_bytes = os.path.getsize("final_model.pt")
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"Serialized factored model: {model_bytes} bytes")
+            log0(f"Code size: {code_bytes} bytes")
+            log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-            # 2. Mixing coefficients (evaluate hypernet, save result)
-            for layer_idx in range(args.num_layers):
-                for type_idx in range(NUM_MATRIX_TYPES):
-                    z = base_model.z_embeds[layer_idx, type_idx]
-                    alpha = base_model.hypernets[type_idx](z).detach().cpu()
-                    export_sd[f"alpha.{layer_idx}.{type_idx}"] = alpha
-
-            # 3. LoRA factors (per layer per type)
-            for layer_idx, block in enumerate(base_model.blocks):
-                for name, module in block.named_modules():
-                    if isinstance(module, HyperLoRALinear) and module.enable_lora:
-                        prefix = f"lora.{layer_idx}.{name}"
-                        export_sd[f"{prefix}.A"] = module.lora_A.detach().cpu()
-                        export_sd[f"{prefix}.B"] = module.lora_B.detach().cpu()
-                        export_sd[f"{prefix}.lambda"] = module.lora_lambda.detach().cpu()
-
-            # 4. Non-HyperLoRA params
-            export_sd["tok_emb.weight"] = base_model.tok_emb.weight.detach().cpu()
-            export_sd["skip_weights"] = base_model.skip_weights.detach().cpu()
-            for layer_idx, block in enumerate(base_model.blocks):
-                prefix = f"blocks.{layer_idx}"
-                export_sd[f"{prefix}.attn_scale"] = block.attn_scale.detach().cpu()
-                export_sd[f"{prefix}.mlp_scale"] = block.mlp_scale.detach().cpu()
-                export_sd[f"{prefix}.resid_mix"] = block.resid_mix.detach().cpu()
-                export_sd[f"{prefix}.q_gain"] = block.attn.q_gain.detach().cpu()
-            if base_model.lm_head is not None:
-                export_sd["lm_head.weight"] = base_model.lm_head.weight.detach().cpu()
-
-        # Quantize and compress the factored state dict
         quant_obj, quant_stats = quantize_state_dict_int8(export_sd)
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
@@ -1361,65 +1582,32 @@ def main() -> None:
             quant_blob_disk = f.read()
         quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
         rt_sd = dequantize_state_dict_int8(quant_state)
-
-        # Reconstruct dense weights from factored form for evaluation
-        with torch.no_grad():
-            for layer_idx, block in enumerate(base_model.blocks):
-                for name, module in block.named_modules():
-                    if isinstance(module, HyperLoRALinear):
-                        # Find the type_idx from name
-                        type_map = {"attn.c_q": 0, "attn.c_k": 1, "attn.c_v": 2, "attn.proj": 3, "mlp.fc": 4, "mlp.proj": 5}
-                        type_idx = type_map.get(name, -1)
-                        if type_idx < 0:
-                            continue
-                        # Reconstruct basis + alpha -> W_base
-                        P = rt_sd[f"basis.{type_idx}.P"].to(device)
-                        Q = rt_sd[f"basis.{type_idx}.Q"].to(device)
-                        alpha = rt_sd[f"alpha.{layer_idx}.{type_idx}"].to(device)
-                        K = alpha.shape[0]
-                        P_3d = P.view(K, module.out_dim, -1)
-                        Q_3d = Q.view(K, module.in_dim, -1)
-                        W = torch.einsum('k, kos, kis -> oi', alpha, P_3d, Q_3d)
-                        # Add LoRA
-                        prefix = f"lora.{layer_idx}.{name}"
-                        if module.enable_lora and f"{prefix}.A" in rt_sd:
-                            A = rt_sd[f"{prefix}.A"].to(device)
-                            B = rt_sd[f"{prefix}.B"].to(device)
-                            lam = rt_sd[f"{prefix}.lambda"].to(device)
-                            scaling = module.lora_alpha_value / module.lora_rank
-                            W = W + lam * scaling * (A @ B)
-                        # Load reconstructed basis/lora back (so forward works)
-                        module.basis.P.data = P.to(module.basis.P.device, dtype=module.basis.P.dtype)
-                        module.basis.Q.data = Q.to(module.basis.Q.device, dtype=module.basis.Q.dtype)
-                        if module.enable_lora and f"{prefix}.A" in rt_sd:
-                            module.lora_A.data = A.to(module.lora_A.device, dtype=module.lora_A.dtype)
-                            module.lora_B.data = B.to(module.lora_B.device, dtype=module.lora_B.dtype)
-                            module.lora_lambda.data = lam.to(module.lora_lambda.device, dtype=module.lora_lambda.dtype)
-
-                # Restore non-hyper block params
-                prefix_b = f"blocks.{layer_idx}"
-                block.attn_scale.data = rt_sd[f"{prefix_b}.attn_scale"].to(device, dtype=block.attn_scale.dtype)
-                block.mlp_scale.data = rt_sd[f"{prefix_b}.mlp_scale"].to(device, dtype=block.mlp_scale.dtype)
-                block.resid_mix.data = rt_sd[f"{prefix_b}.resid_mix"].to(device, dtype=block.resid_mix.dtype)
-                block.attn.q_gain.data = rt_sd[f"{prefix_b}.q_gain"].to(device, dtype=block.attn.q_gain.dtype)
-
-            # Restore alpha into z_embeds/hypernets (reload the alpha values as z_embeds won't be used)
-            base_model.tok_emb.weight.data = rt_sd["tok_emb.weight"].to(device, dtype=base_model.tok_emb.weight.dtype)
-            base_model.skip_weights.data = rt_sd["skip_weights"].to(device, dtype=base_model.skip_weights.dtype)
-            if base_model.lm_head is not None and "lm_head.weight" in rt_sd:
-                base_model.lm_head.weight.data = rt_sd["lm_head.weight"].to(device, dtype=base_model.lm_head.weight.dtype)
+        qeval_model = init_hyper_gpt(args, device)
+        load_factored_state_dict_into_model(qeval_model, rt_sd, args, device)
 
     else:
-        # Dense mode: original export pipeline
+        if args.hyper_mode == "dense":
+            log0("export_mode:dense")
+            export_model = base_model
+        else:
+            log0("export_mode:dense_baseline")
+            export_model = build_dense_export_model(base_model, args)
+        export_model_params = sum(p.numel() for p in export_model.parameters())
+        log0(f"export_model_params:{export_model_params}")
+        if wandb_run is not None:
+            wandb_run.summary["export_model_params"] = export_model_params
+            wandb_run.summary["train_to_export_param_ratio"] = n_params / max(export_model_params, 1)
+
+        export_state_dict = export_model.state_dict()
         if master_process:
-            torch.save(base_model.state_dict(), "final_model.pt")
+            torch.save(export_state_dict, "final_model.pt")
             model_bytes = os.path.getsize("final_model.pt")
             code_bytes = len(code.encode("utf-8"))
             log0(f"Serialized model: {model_bytes} bytes")
             log0(f"Code size: {code_bytes} bytes")
             log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-        quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+        quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict)
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
@@ -1442,13 +1630,19 @@ def main() -> None:
         with open("final_model.int8.ptz", "rb") as f:
             quant_blob_disk = f.read()
         quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        rt_sd = dequantize_state_dict_int8(quant_state)
+        if args.hyper_mode == "dense":
+            base_model.load_state_dict(rt_sd, strict=True)
+            qeval_model = base_model
+        else:
+            qeval_model = init_dense_gpt(args, device)
+            qeval_model.load_state_dict(rt_sd, strict=True)
 
     # Final eval on roundtripped weights
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
-        args, model, rank, world_size, device, grad_accum_steps,
+        args, qeval_model, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
@@ -1457,6 +1651,17 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                "artifact/final_roundtrip_val_loss": q_val_loss,
+                "artifact/final_roundtrip_val_bpb": q_val_bpb,
+            },
+            step=step,
+        )
+        wandb_run.summary["final_roundtrip_val_loss"] = q_val_loss
+        wandb_run.summary["final_roundtrip_val_bpb"] = q_val_bpb
+        wandb_run.finish()
 
     if distributed:
         dist.destroy_process_group()
